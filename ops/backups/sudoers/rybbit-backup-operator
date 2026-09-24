@@ -1,0 +1,1 @@
+rybbit-backup-operator ALL=(root) NOPASSWD: /opt/rybbit-backups/bin/operator-audit.sh, /opt/rybbit-backups/bin/operator-run.sh postgres, /opt/rybbit-backups/bin/operator-run.sh clickhouse

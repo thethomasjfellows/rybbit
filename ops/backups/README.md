@@ -1,14 +1,14 @@
 # Database backups
 
-These scripts create database-consistent backups for the three production
-hosts. They intentionally do not archive live Docker volumes.
+These scripts create database-consistent backups. They intentionally do not
+archive live Docker volumes.
 
 ## Host map
 
 | Host | PostgreSQL | ClickHouse |
 | --- | --- | --- |
 | FrogStats | Native `pg_dump` to B2 | Native `BACKUP` directly to B2 |
-| Rybbit | Native `pg_dump` to B2 | Not backed up here; production uses the standalone host |
+| Rybbit RackNerd | Native `pg_dump` to R2 | Native `BACKUP` archive uploaded to R2 |
 | ClickHouse | None | Native `BACKUP` staged locally and copied to B2 |
 
 PostgreSQL dumps include a custom-format database archive, cluster globals,
@@ -37,10 +37,31 @@ sudo rclone config
 sudo chmod 600 /root/.config/rclone/rclone.conf
 ```
 
-The examples use a Backblaze remote named `backblaze`. Data is protected in
-transit by TLS and at rest by B2 server-side encryption. The direct FrogStats
+The FrogStats and standalone ClickHouse examples use a Backblaze remote named
+`backblaze`. Data is protected in transit by TLS and at rest by B2 server-side
+encryption. The direct FrogStats
 ClickHouse backup is written through ClickHouse's S3-compatible client. Its B2
 credentials live in a ClickHouse named collection rather than the backup SQL.
+
+The all-in-one Rybbit RackNerd host uses a Cloudflare R2 remote named
+`rybbit_r2`, with a token limited to the `rybbit-backups` bucket. Configure the
+bucket's object lifecycle separately; the backup scripts do not delete remote
+objects. The host's rclone configuration is root-readable only. The ClickHouse
+`file` mode writes a native `.tar` archive to the existing ClickHouse backup
+directory, copies it to a temporary staging directory, checksums it, uploads
+and verifies it, then removes the local copies. This avoids a ClickHouse
+container restart. The backup includes replay tables, so the bucket lifecycle
+controls how long historical replay data may remain in backup copies after the
+live 14-day table TTL removes it.
+
+The optional `rybbit-backup-operator` SSH account is key-only and cannot run
+arbitrary commands as root. Its sudoers rule permits only `operator-audit.sh`
+and `operator-run.sh` with `postgres` or `clickhouse`. Keep its private key in
+the Yolo Agents Infisical project, not in the repository or on the VPS.
+Install the two operator scripts as root-owned executable files alongside the
+backup scripts, install `ops/backups/sudoers/rybbit-backup-operator` with mode
+`0440`, and validate it with `visudo -cf` before using the account. The
+operator's `authorized_keys` entry should use OpenSSH's `restrict` option.
 
 ## Install on each host
 
@@ -178,7 +199,7 @@ sudo systemctl daemon-reload
 sudo systemctl start rybbit-postgres-backup.service
 sudo journalctl -u rybbit-postgres-backup.service -n 100 --no-pager
 
-# FrogStats and the standalone ClickHouse host only:
+# Every host running ClickHouse, including the all-in-one Rybbit host:
 sudo systemctl start rybbit-clickhouse-backup.service
 sudo journalctl -u rybbit-clickhouse-backup.service -n 100 --no-pager
 ```
@@ -187,7 +208,7 @@ After verifying objects at every configured destination:
 
 ```bash
 sudo systemctl enable --now rybbit-postgres-backup.timer
-# FrogStats and the standalone ClickHouse host only:
+# Every host running ClickHouse, including the all-in-one Rybbit host:
 sudo systemctl enable --now rybbit-clickhouse-backup.timer
 ```
 
@@ -195,8 +216,11 @@ The PostgreSQL timer runs every six hours. The ClickHouse timer runs daily with
 a randomized delay. Use systemd timer overrides if the two ClickHouse hosts
 should run in different windows.
 
-B2 retention should be implemented with bucket lifecycle rules, especially
-when Object Lock is enabled. Never add an Object-Locked B2 remote to
+Remote retention should be implemented with bucket lifecycle rules, especially
+when Object Lock is enabled. The Rybbit R2 bucket has a 14-day object expiry;
+this is separate from the live replay table's 14-day TTL. A backup can contain
+replay events that are older than 14 days by the time the object expires. Never
+add an Object-Locked B2 remote to
 `CLICKHOUSE_PRUNE_REMOTES`.
 
 ## Restore drills
@@ -204,23 +228,27 @@ when Object Lock is enabled. Never add an Object-Locked B2 remote to
 Always restore into a disposable container or a differently named database
 first. Never test a restore against production.
 
-For PostgreSQL, download one backup directory through the B2 remote, verify it,
-restore globals, and then restore the custom archive:
+For PostgreSQL, download one backup directory through the configured remote,
+verify it, and restore into a disposable PostgreSQL 17 container with no
+published ports:
 
 ```bash
 cd /var/tmp/postgres-restore
 sha256sum --check SHA256SUMS
-docker exec -i postgres sh -ec \
-  'exec psql -U "$POSTGRES_USER" -d postgres' < globals.sql
-docker exec postgres sh -ec \
-  'exec createdb -U "$POSTGRES_USER" analytics_restore'
-docker exec -i postgres sh -ec \
-  'exec pg_restore -U "$POSTGRES_USER" --dbname analytics_restore --clean --if-exists' \
-  < database.dump
+docker run -d --rm --network none --name rybbit-restore-pg \
+  -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17.4
+# Wait until docker exec rybbit-restore-pg pg_isready -U postgres succeeds.
+docker exec -i rybbit-restore-pg psql -U postgres -v ON_ERROR_STOP=1 \
+  -d postgres < globals.sql
+docker exec rybbit-restore-pg createdb -U postgres analytics
+docker exec -i rybbit-restore-pg pg_restore -U postgres -d analytics \
+  --no-owner --no-privileges < database.dump
+docker exec rybbit-restore-pg psql -U postgres -d analytics -Atqc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
+docker rm -f rybbit-restore-pg
 ```
 
-Review the globals SQL before applying it when restoring into a shared
-PostgreSQL cluster.
+Never apply `globals.sql` to a shared PostgreSQL cluster during a drill.
 
 For a direct S3 ClickHouse backup, use the installed named collection and a
 different destination database name:
@@ -238,6 +266,18 @@ to the configured host staging root and restore it from the backup disk:
 RESTORE DATABASE analytics AS analytics_restore
 FROM Disk('backups', 'BACKUP_DIRECTORY');
 ```
+
+For the all-in-one Rybbit host, download the `.tar` archive and its checksum,
+then mount the directory read-only into a disposable ClickHouse container of
+the same version, with no published ports. The mounted directory and archive
+must be readable by the container's ClickHouse user. Restore with:
+
+```sql
+RESTORE DATABASE analytics FROM File('BACKUP_ARCHIVE.tar');
+```
+
+Check the restored table count, remove the disposable container, and remove
+local drill files. Do not run this command in the live ClickHouse container.
 
 Perform and record a restore drill at least monthly. A successful upload is not
 proof that the backup can be restored.

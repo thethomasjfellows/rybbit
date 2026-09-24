@@ -53,8 +53,8 @@ DRY_RUN="${DRY_RUN:-false}"
 validate_simple_name BACKUP_HOST "$BACKUP_HOST"
 validate_simple_name CLICKHOUSE_CONTAINER "$CLICKHOUSE_CONTAINER"
 validate_identifier CLICKHOUSE_DATABASE "$CLICKHOUSE_DATABASE"
-[[ "$CLICKHOUSE_BACKUP_MODE" == "s3" || "$CLICKHOUSE_BACKUP_MODE" == "local" ]] || \
-  fatal "CLICKHOUSE_BACKUP_MODE must be 's3' or 'local'"
+[[ "$CLICKHOUSE_BACKUP_MODE" == "s3" || "$CLICKHOUSE_BACKUP_MODE" == "local" || "$CLICKHOUSE_BACKUP_MODE" == "file" ]] || \
+  fatal "CLICKHOUSE_BACKUP_MODE must be 's3', 'local', or 'file'"
 [[ "$CLICKHOUSE_BACKUP_RECEIVE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || \
   fatal "CLICKHOUSE_BACKUP_RECEIVE_TIMEOUT must be a positive integer"
 
@@ -77,7 +77,7 @@ if [[ "$CLICKHOUSE_BACKUP_MODE" == "s3" ]]; then
   log "Creating native ClickHouse backup of ${CLICKHOUSE_DATABASE} directly in object storage"
   QUERY="SET log_queries = 0; BACKUP DATABASE \`${CLICKHOUSE_DATABASE}\` TO S3(${CLICKHOUSE_S3_NAMED_COLLECTION}, $(sql_string "$BACKUP_NAME")) SETTINGS compression_method = 'zstd', compression_level = 1;"
   run_clickhouse_query "$QUERY"
-else
+elif [[ "$CLICKHOUSE_BACKUP_MODE" == "local" ]]; then
   CLICKHOUSE_BACKUP_DISK="${CLICKHOUSE_BACKUP_DISK:-backups}"
   CLICKHOUSE_LOCAL_BACKUP_ROOT="${CLICKHOUSE_LOCAL_BACKUP_ROOT:-/var/backups/rybbit/clickhouse}"
   CLICKHOUSE_KEEP_LOCAL_BACKUP="${CLICKHOUSE_KEEP_LOCAL_BACKUP:-false}"
@@ -121,4 +121,45 @@ else
     log "Removing completed local staging backup"
     safe_delete_staging_dir "$CLICKHOUSE_LOCAL_BACKUP_ROOT" "$LOCAL_BACKUP_DIR"
   fi
+else
+  # File() writes a native archive to ClickHouse's existing backups directory.
+  # It needs no disk configuration or container restart on an all-in-one host.
+  CLICKHOUSE_FILE_BACKUP_ROOT="${CLICKHOUSE_FILE_BACKUP_ROOT:-}"
+  CLICKHOUSE_STAGING_ROOT="${CLICKHOUSE_STAGING_ROOT:-/var/backups/rybbit/clickhouse}"
+  require_value CLICKHOUSE_FILE_BACKUP_ROOT
+  require_value CLICKHOUSE_RCLONE_REMOTES
+  ARCHIVE_NAME="${BACKUP_NAME}.tar"
+  ARCHIVE_PATH="${CLICKHOUSE_FILE_BACKUP_ROOT%/}/${ARCHIVE_NAME}"
+  STAGING_DIR="${CLICKHOUSE_STAGING_ROOT%/}/${BACKUP_NAME}"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "DRY RUN: would create native ClickHouse archive ${ARCHIVE_PATH}"
+    log "DRY RUN: would upload to ${CLICKHOUSE_RCLONE_REMOTES}"
+    exit 0
+  fi
+
+  require_command docker
+  require_command flock
+  require_command rclone
+  require_command sha256sum
+  acquire_lock "$CLICKHOUSE_LOCK_FILE"
+  [[ -d "$CLICKHOUSE_FILE_BACKUP_ROOT" ]] || fatal "ClickHouse backup directory does not exist"
+  [[ ! -e "$ARCHIVE_PATH" && ! -e "$STAGING_DIR" ]] || fatal "Backup path already exists"
+
+  log "Creating native ClickHouse archive of ${CLICKHOUSE_DATABASE}"
+  QUERY="SET log_queries = 0; BACKUP DATABASE \`${CLICKHOUSE_DATABASE}\` TO File($(sql_string "$ARCHIVE_NAME"));"
+  run_clickhouse_query "$QUERY"
+  [[ -s "$ARCHIVE_PATH" ]] || fatal "ClickHouse archive was not found or is empty"
+
+  mkdir -p "$STAGING_DIR"
+  cp -- "$ARCHIVE_PATH" "$STAGING_DIR/$ARCHIVE_NAME"
+  (
+    cd "$STAGING_DIR"
+    sha256sum "$ARCHIVE_NAME" >SHA256SUMS
+  )
+  upload_directory "$STAGING_DIR" "$BACKUP_NAME" "$CLICKHOUSE_RCLONE_REMOTES"
+
+  log "Removing verified local staging copies"
+  rm -- "$ARCHIVE_PATH"
+  safe_delete_staging_dir "$CLICKHOUSE_STAGING_ROOT" "$STAGING_DIR"
 fi
